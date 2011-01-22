@@ -1,11 +1,9 @@
 # This file is covered by the Ruby license. See COPYING for more details.
 # Copyright (C) 2009-2010, Apple Inc. All rights reserved.
 
-framework 'Foundation'
-require 'CTParser'
+require 'jcd'
 require 'stringio'
-
-CTParser # Making sure the Objective-C class is pre-loaded
+require 'mongrel'
 
 module ControlTower
   class RackSocket
@@ -30,89 +28,76 @@ module ControlTower
 
     def open
       @status = :open
+      @classifier = Mongrel::URIClassifier.new
       while (@status == :open)
-        connection = @socket.accept
-
-        @request_queue.async(@request_group) do
-          env = { 'rack.errors' => $stderr,
-                  'rack.multiprocess' => false,
-                  'rack.multithread' => @multithread,
-                  'rack.run_once' => false,
-                  'rack.version' => VERSION }
-          resp = nil
-          x_sendfile_header = 'X-Sendfile'
-          x_sendfile = nil
-          begin
-            request_data = parse!(connection, env)
-            if request_data
-              request_data['REMOTE_ADDR'] = connection.addr[3]
-              status, headers, body = @app.call(request_data)
-
-              # If there's an X-Sendfile header, we'll use sendfile(2)
-              if headers.has_key?(x_sendfile_header)
-                x_sendfile = headers[x_sendfile_header]
-                x_sendfile = ::File.open(x_sendfile, 'r') unless x_sendfile.kind_of? IO
-                x_sendfile_size = x_sendfile.stat.size
-                headers.delete(x_sendfile_header)
-                headers['Content-Length'] = x_sendfile_size
-              end
-
-              # Unless somebody's already set it for us (or we don't need it), set the Content-Length
-              unless (status == -1 ||
-                      (status >= 100 and status <= 199) ||
-                      status == 204 ||
-                      status == 304 ||
-                      headers.has_key?('Content-Length'))
-                headers['Content-Length'] = if body.respond_to?(:each)
-                                              size = 0
-                                              body.each { |x| size += x.bytesize }
-                                              size
-                                            else
-                                              body.bytesize
-                                            end
-              end
-
-              # TODO -- We don't handle keep-alive connections yet
-              headers['Connection'] = 'close'
-
-              resp = "HTTP/1.1 #{status}\r\n"
-              headers.each do |header, value|
-                resp << "#{header}: #{value}\r\n"
-              end
-              resp << "\r\n"
-
-              # Start writing the response
-              connection.write resp
-
-              # Write the body
-              if x_sendfile
-                connection.sendfile(x_sendfile, 0, x_sendfile_size)
-              elsif body.respond_to?(:each)
-                body.each do |chunk|
-                  connection.write chunk
+        conn = @socket.accept
+        
+        conn.tap do |connection|
+          @request_queue.async(@request_group) do
+            begin
+              request, response = parse!(connection)
+              if request
+                env = {}.replace(request.params)
+                env.delete "HTTP_CONTENT_TYPE"
+                env.delete "HTTP_CONTENT_LENGTH"
+                
+                env["SCRIPT_NAME"] = ""  if env["SCRIPT_NAME"] == "/"
+                
+                rack_input = request.body || StringIO.new('')
+                rack_input.set_encoding(Encoding::BINARY) if rack_input.respond_to?(:set_encoding)
+                
+                env.update({"rack.version" => Rack::VERSION,
+                  "rack.input" => rack_input,
+                  "rack.errors" => $stderr,
+                  
+                  "rack.multithread" => true,
+                  "rack.multiprocess" => false, # ???
+                  "rack.run_once" => false,
+                  
+                  "rack.url_scheme" => "http",
+                  })
+                  env["QUERY_STRING"] ||= ""
+                  
+                  status, headers, body = @app.call(env)
+                  
+                begin
+                  response.status = status.to_i
+                  response.send_status(nil)
+                  
+                  headers.each { |k, vs|
+                    vs.split("\n").each { |v|
+                      response.header[k] = v
+                    }
+                  }
+                  response.send_header
+                  
+                  body.each { |part|
+                    response.write part
+                    response.socket.flush
+                  }
+                ensure
+                  body.close  if body.respond_to? :close
                 end
+                
               else
-                connection.write body
+                $stderr.puts "Error: No request data received!"
               end
-
-            else
-              $stderr.puts "Error: No request data received!"
+            rescue EOFError, Errno::ECONNRESET, Errno::EPIPE, Errno::EINVAL
+              $stderr.puts "Error: Connection terminated!"
+            rescue Object => e
+              if response.nil? && !connection.closed?
+                connection.write "HTTP/1.1 400\r\n\r\n"
+              else
+                # We have a response, but there was trouble sending it:
+                $stderr.puts "Error: Problem transmitting data -- #{e.inspect}"
+                $stderr.puts e.backtrace.join("\n")
+              end
+            ensure
+              # We should clean up after our tempfile, if we used one.
+              # input = env['rack.input']
+              # input.unlink if input.class == Tempfile
+              connection.close rescue nil
             end
-          rescue EOFError, Errno::ECONNRESET, Errno::EPIPE, Errno::EINVAL
-            $stderr.puts "Error: Connection terminated!"
-          rescue Object => e
-            if resp.nil? && !connection.closed?
-              connection.write "HTTP/1.1 400\r\n\r\n"
-            else
-              # We have a response, but there was trouble sending it:
-              $stderr.puts "Error: Problem transmitting data -- #{e.inspect}"
-              $stderr.puts e.backtrace.join("\n")
-            end
-          ensure
-            # We should clean up after our tempfile, if we used one.
-            input = env['rack.input']
-            input.unlink if input.class == Tempfile
-            connection.close rescue nil
           end
         end
       end
@@ -133,49 +118,71 @@ module ControlTower
 
     private
 
-    def parse!(connection, env)
-      parser = Thread.current[:http_parser] ||= CTParser.new
-      parser.reset
-      data = NSMutableData.alloc.init
-      data.increaseLengthBy(1) # add sentinel
-      parsing_headers = true # Parse headers first
-      nread = 0
-      content_length = 0
-      content_uploaded = 0
-      connection_handle = NSFileHandle.alloc.initWithFileDescriptor(connection.fileno)
+    def parse!(client)
+      begin
+        parser = Mongrel::HttpParser.new
+        params = Mongrel::HttpParams.new
+        request = nil
+        data = client.readpartial(Mongrel::Const::CHUNK_SIZE)
+        nparsed = 0
 
-      while (parsing_headers || content_uploaded < content_length) do
-        # Read the availableData on the socket and give up if there's nothing
-        incoming_bytes = connection_handle.availableData
-        return nil if incoming_bytes.length == 0
+        # Assumption: nparsed will always be less since data will get filled with more
+        # after each parsing.  If it doesn't get more then there was a problem
+        # with the read operation on the client socket.  Effect is to stop processing when the
+        # socket can't fill the buffer for further parsing.
+        while nparsed < data.length
+          nparsed = parser.execute(params, data, nparsed)
 
-        # Until the headers are done being parsed, we'll parse them
-        if parsing_headers
-          data.setLength(data.length - 1) # Remove sentinel
-          data.appendData(incoming_bytes)
-          data.increaseLengthBy(1) # Add sentinel
-          nread = parser.parseData(data, forEnvironment: env, startingAt: nread)
-          if parser.finished == 1
-            parsing_headers = false # We're done, now on to receiving the body
-            content_length = env['CONTENT_LENGTH'].to_i
-            content_uploaded = env['rack.input'].length
+          if parser.finished?
+            if not params[Mongrel::Const::REQUEST_PATH]
+              # it might be a dumbass full host request header
+              uri = URI.parse(params[Mongrel::Const::REQUEST_URI])
+              params[Mongrel::Const::REQUEST_PATH] = uri.path
+            end
+
+            raise "No REQUEST PATH" if not params[Mongrel::Const::REQUEST_PATH]
+
+            script_name, path_info, handlers = @classifier.resolve(params[Mongrel::Const::REQUEST_PATH])
+            
+            params[Mongrel::Const::PATH_INFO] = path_info
+            params[Mongrel::Const::SCRIPT_NAME] = script_name
+
+            # From http://www.ietf.org/rfc/rfc3875 :
+            # "Script authors should be aware that the REMOTE_ADDR and REMOTE_HOST
+            #  meta-variables (see sections 4.1.8 and 4.1.9) may not identify the
+            #  ultimate source of the request.  They identify the client for the
+            #  immediate request to the server; that client may be a proxy, gateway,
+            #  or other intermediary acting on behalf of the actual source client."
+            params[Mongrel::Const::REMOTE_ADDR] = client.peeraddr.last
+            
+            notifiers = []
+            request = Mongrel::HttpRequest.new(params, client, notifiers)
+
+            # in the case of large file uploads the user could close the socket, so skip those requests
+            raise "closed request" if request.body == nil  # nil signals from HttpRequest::initialize that the request was aborted
+
+            # request is good so far, continue processing the response
+            response = Mongrel::HttpResponse.new(client)
+            
+            return request, response
+          else
+            # Parser is not done, queue up more data to read and continue parsing
+            chunk = client.readpartial(Mongrel::Const::CHUNK_SIZE)
+            break if !chunk or chunk.length == 0  # read failed, stop processing
+
+            data << chunk
+            if data.length >= Mongrel::Const::MAX_HEADER
+              raise Mongrel::HttpParserError.new("HEADER is longer than allowed, aborting client early.")
+            end
           end
-        else # Done parsing headers, now just collect request body:
-          content_uploaded += incoming_bytes.length
-          env['rack.input'].appendData(incoming_bytes)
         end
+      rescue Mongrel::HttpParserError => e
+        STDERR.puts "#{Time.now}: HTTP parse error, malformed request (#{params[Mongrel::Const::HTTP_X_FORWARDED_FOR] || client.peeraddr.last}): #{e.inspect}"
+        STDERR.puts "#{Time.now}: REQUEST DATA: #{data.inspect}\n---\nPARAMS: #{params.inspect}\n---\n"
+      rescue Exception => e
+        STDERR.puts "#{Time.now}: Read error: #{e.inspect}"
+        STDERR.puts e.backtrace.join("\n")
       end
-
-      if content_length > 1024 * 1024
-        body_file = Tempfile.new('control-tower-request-body-')
-        NSFileHandle.alloc.initWithFileDescriptor(body_file.fileno).writeData(env['rack.input'])
-        body_file.rewind
-        env['rack.input'] = body_file
-      else
-        env['rack.input'] = StringIO.new(env['rack.input'])
-      end
-      # Returning what we've got...
-      return env
     end
   end
 end
